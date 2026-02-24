@@ -576,6 +576,7 @@
                     <select id="fashion-category-select" style="margin-bottom: 12px;">
                         <option value="上衣 (T恤 / 襯衫 / 針織衫 / 毛衣)">👕 上衣 (T恤 / 襯衫 / 針織衫 / 毛衣)</option>
                         <option value="下身 (褲子 / 裙子)">👖 下身 (褲子 / 裙子)</option>
+                        <!-- 修正了之前錯亂的「西裝」文字 -->
                         <option value="外套 (夾克 / 大衣 / 西裝)">🧥 外套 (夾克 / 大衣 / 西裝)</option>
                         <option value="洋裝 / 連身裙">👗 洋裝 / 連身裙</option>
                         <option value="配件 (包包 / 圍巾 / 帽子)">🧣 配件 (包包 / 圍巾 / 帽子)</option>
@@ -665,43 +666,71 @@
     let currentImageFile = null;
     let currentFashionImageFile = null;
 
-    // --- 【防 429 神器】進階 API 重試機制 (Exponential Backoff) ---
-    async function fetchWithRetry(url, options) {
-        // 遇到 429 時的退避等待時間：1秒, 2秒, 4秒, 8秒, 16秒 (共重試 5 次)
-        const delays = [1000, 2000, 4000, 8000, 16000];
-        let lastError;
-
-        for (let i = 0; i <= delays.length; i++) {
-            try {
-                const response = await fetch(url, options);
-
-                // 如果發生 429，主動拋出例外讓外層捕捉重試
-                if (response.status === 429) {
-                    throw new Error("RateLimit");
-                }
-                
-                // 處理其他一般錯誤 (例如 400 API Key 錯誤)
-                if (!response.ok) {
-                    throw await handleApiError(response);
-                }
-
-                // 成功則回傳
-                return response;
-            } catch (error) {
-                lastError = error;
-                // 如果是 RateLimit，且還有重試次數，就等待一段時間後再試
-                if (error.message === "RateLimit" && i < delays.length) {
-                    console.log(`[系統提示] 偵測到頻率限制 (429)，將於 ${delays[i]/1000} 秒後自動重試...`);
-                    await new Promise(resolve => setTimeout(resolve, delays[i]));
-                } else {
-                    // 如果不是 429，或是 429 已經重試到極限了，就拋出最終錯誤給使用者看
-                    if (error.message === "RateLimit") {
-                        throw new Error("伺服器極度繁忙 (HTTP 429) ❌\n系統已自動重試多次，請您先喝口水，休息一分鐘後再點擊按鈕。");
-                    }
-                    throw error;
-                }
-            }
+    // --- 【新增：統一的 JSON 解析器，防止 AI 亂加符號卡死】 ---
+    function parseGeminiResponse(data) {
+        if (!data.candidates || data.candidates.length === 0) {
+            throw new Error("AI 分析遭到阻擋或無回應，請嘗試更換圖片或文字描述。");
         }
+        let textResult = data.candidates[0].content.parts[0].text;
+        // 把 AI 可能亂加的 markdown 語法 (```json ...) 全部清乾淨
+        textResult = textResult.replace(/```json/gi, '').replace(/```/g, '').trim();
+        try {
+            return JSON.parse(textResult);
+        } catch (e) {
+            console.error("解析失敗的原始文字:", textResult);
+            throw new Error("AI 回傳的格式異常，請重新點擊按鈕分析。");
+        }
+    }
+
+    // --- 【終極防 429 神器】全域請求佇列與速率限制 (Global Request Queue) ---
+    // Gemini 免費版限制：15 RPM (每分鐘 15 次)。我們強制讓每個 API 請求間隔至少 4.2 秒。
+    // 這樣 60秒 ÷ 4.2秒 ≈ 14次，在數學上絕對不可能超過免費額度限制！
+    let globalApiQueue = Promise.resolve();
+    const MIN_API_INTERVAL = 4200; 
+
+    function fetchWithRetry(url, options) {
+        return new Promise((resolve, reject) => {
+            // 所有請求依序排隊執行
+            globalApiQueue = globalApiQueue.then(async () => {
+                // 遇到 429 時的退避等待時間：3秒, 6秒, 12秒, 24秒, 45秒
+                const delays = [3000, 6000, 12000, 24000, 45000];
+
+                for (let i = 0; i <= delays.length; i++) {
+                    try {
+                        const response = await fetch(url, options);
+
+                        // 把 429 和 503 視為系統繁忙，丟給重試機制處理
+                        if (response.status === 429 || response.status === 503) {
+                            throw new Error("RateLimit");
+                        }
+                        
+                        if (!response.ok) {
+                            throw await handleApiError(response);
+                        }
+
+                        // 【重點】請求成功後，強制系統暫停 4.2 秒，才允許佇列中的下一個請求發送
+                        await new Promise(r => setTimeout(r, MIN_API_INTERVAL));
+                        resolve(response);
+                        return; // 結束重試迴圈
+                    } catch (error) {
+                        if (error.message === "RateLimit" && i < delays.length) {
+                            console.log(`[系統自動排隊] 伺服器稍忙，將於 ${delays[i]/1000} 秒後自動重新發送...`);
+                            await new Promise(r => setTimeout(r, delays[i]));
+                        } else {
+                            // 即使失敗，也要強制暫停 4.2 秒，避免後續請求連環撞車
+                            await new Promise(r => setTimeout(r, MIN_API_INTERVAL));
+                            
+                            if (error.message === "RateLimit") {
+                                reject(new Error("⚠️ Google API 額度已達上限 (HTTP 429)！\n\n1. 如果您剛才連續按了太多次按鈕，請等待 1 到 2 分鐘讓頻率重置。\n2. 如果您今天已經用很久，可能是「每日 1500 次」的免費額度已滿，需等明日重置。"));
+                            } else {
+                                reject(error);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }).catch(reject);
+        });
     }
 
     // --- 共用的錯誤處理函數 ---
@@ -822,12 +851,10 @@
 
     // --- 圖片壓縮函數 ---
     function compress(file) {
-        return new Promise(resolve => {
+        return new Promise((resolve, reject) => {
             const r = new FileReader();
-            r.readAsDataURL(file);
             r.onload = e => {
                 const img = new Image();
-                img.src = e.target.result;
                 img.onload = () => {
                     const cvs = document.createElement('canvas');
                     const max = 1024;
@@ -837,7 +864,11 @@
                     cvs.getContext('2d').drawImage(img,0,0,w,h);
                     resolve(cvs.toDataURL('image/jpeg', 0.8).split(',')[1]);
                 };
+                img.onerror = () => reject(new Error("圖片格式不支援。請嘗試將圖片在相簿截圖後，再上傳截圖檔案！"));
+                img.src = e.target.result;
             };
+            r.onerror = () => reject(new Error("無法讀取圖片檔案，請重新選擇。"));
+            r.readAsDataURL(file);
         });
     }
 
@@ -856,6 +887,8 @@
 
         try {
             const base64Data = await compress(currentImageFile);
+            
+            // 完整無截斷的 Prompt 提示詞
             const prompt = `
                 你是一位專業的韓國 Personal Color 色彩分析師。
                 請仔細分析這張人像照片中人物的膚色基調（冷暖）、原生髮色和瞳孔色，並判斷他屬於哪一個四季色彩型別。
@@ -877,7 +910,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
 
             const seasonSelect = document.getElementById('season-select');
             let matched = false;
@@ -970,7 +1003,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
 
             document.getElementById('result-score').textContent = `${resultJson.score} 分`;
             document.getElementById('result-score').style.color = resultJson.score >= 80 ? '#7B8D82' : (resultJson.score >= 60 ? '#C19A6B' : '#B47A7A');
@@ -1017,7 +1050,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
 
             resultList.innerHTML = resultJson.map(item => `
                 <div class="rec-item">
@@ -1069,7 +1102,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
             localStorage.setItem(cacheKey, JSON.stringify(resultJson));
             renderRecommendations(resultJson);
         } catch (error) {
@@ -1125,7 +1158,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
             localStorage.setItem(cacheKey, JSON.stringify(resultJson));
             renderFashionGuide(resultJson);
         } catch (error) {
@@ -1174,7 +1207,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
 
             resultList.innerHTML = resultJson.map(item => {
                 const searchUrl = item.brand.toUpperCase().includes('GU') 
@@ -1247,7 +1280,7 @@
             });
 
             const data = await response.json();
-            const resultJson = JSON.parse(data.candidates[0].content.parts[0].text);
+            const resultJson = parseGeminiResponse(data);
 
             document.getElementById('fashion-result-score').textContent = `${resultJson.score} 分`;
             document.getElementById('fashion-result-score').style.color = resultJson.score >= 80 ? '#7B8D82' : (resultJson.score >= 60 ? '#C19A6B' : '#B47A7A');
